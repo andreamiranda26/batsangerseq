@@ -247,88 +247,160 @@ nearest_tbl$call_strength <- with(nearest_tbl, ifelse(
 cat("\n## Top matches (head):\n")
 print(head(nearest_tbl, 10))
 
-write.csv(nearest_tbl, "cytb_unknown_best_matches.csv", row.names = FALSE)
-cat("\nWrote: cytb_unknown_best_matches.csv\n")
+write.csv(nearest_tbl, "cytb_unknown_best_matches300.csv", row.names = FALSE)
+cat("\nWrote: cytb_unknown_best_matches148.csv\n")
 
-# ───────────────────────── 5) Quick NJ tree ─────────────────────────
-pdf("cytb_nj_tree.pdf", width = 8.5, height = 11)
-tree <- njs(as.dist(dist_mat))
-plot(tree, cex = 0.6)
-unk_tips <- match(names(combined_aln)[unknown_ix], tree$tip.label)
-tiplabels(pch = 19, tip = unk_tips, col = "red", cex = 0.6)
-legend("topleft", legend = c("Unknown"), pch = 19, col = "red", bty = "n", cex = 0.8)
-dev.off()
-cat("Wrote: cytb_nj_tree.pdf\n")
 
-# ───────────────────── 6) Visual alignment check ─────────────────────
-try({
-  DECIPHER::BrowseSeqs(combined_aln, highlight = which(is_unknown))
-}, silent = TRUE)
+# ───────────────────────── 5) Quick NJ tree (less crowded) ─────────────────────────
+# ==== Legible NJ figure: sample labels colored by predicted species ====
+library(ape)
 
-cat("\nOpen 'cytb_name_labels.csv' to confirm labels, ",
-    "'cytb_unknown_best_matches.csv' for IDs, and 'cytb_nj_tree.pdf' to visualize clustering.\n", sep = "")
-#-------------------------
-  
-  
-  
-  library(ape)
-library(Biostrings)
-
-# Read nearest-match results
+# Read nearest-match results and extract Genus species from 'best_known'
 nearest <- read.csv("cytb_unknown_best_matches.csv", stringsAsFactors = FALSE)
 
-# Extract "Genus species" from best_known headers like "MF135770.1 Tadarida brasiliensis voucher ..."
-extract_species <- function(x) {
+extract_species <- function(x){
   m <- regexec("^[^ ]+\\s+([A-Z][a-z]+\\s+[a-z]+)", x)
   sapply(regmatches(x, m), function(v) if (length(v) >= 2) v[2] else NA_character_)
 }
 nearest$pred_species <- extract_species(nearest$best_known)
+nearest$pred_species[is.na(nearest$pred_species)] <- "Unassigned"
 
-# Map unknown IDs to their indices in the combined alignment / tree
-id_in_tree <- match(nearest$unknown, names(combined_aln))
+# Map sample IDs to the tree tips
+idx <- match(nearest$unknown, tree$tip.label)
+present <- !is.na(idx)
 
-# 1) Relabel tips with predicted species and % identity
-new_labels <- tree$tip.label
-ok <- !is.na(id_in_tree)
-new_labels[id_in_tree[ok]] <- paste0(
-  new_labels[id_in_tree[ok]], " [",
-  nearest$pred_species[ok], " ",
-  nearest$pct_identity[ok], "%]"
-)
-tree_annot <- tree
-tree_annot$tip.label <- new_labels
+# Labels: ONLY show sample names (references blank)
+lab <- rep("", length(tree$tip.label))
+lab[idx[present]] <- nearest$unknown[present]
 
-pdf("cytb_nj_tree_annotated.pdf", width = 8.5, height = 11)
-plot(tree_annot, cex = 0.55)
-title("NJ tree with unknowns relabeled by predicted species (%)")
+# Colors: default grey for references; color samples by predicted species
+# Order legend by how often each species occurs (most common first)
+sp_order <- names(sort(table(nearest$pred_species[present]), decreasing = TRUE))
+pal <- tryCatch(grDevices::hcl.colors(length(sp_order), "Set 3"),
+                error = function(e) grDevices::rainbow(length(sp_order)))
+sp_cols <- setNames(pal, sp_order)
+
+tip_cols <- rep("grey70", length(tree$tip.label))
+tip_cols[idx[present]] <- sp_cols[ nearest$pred_species[present] ]
+
+# Swap in our sample-only labels
+tree_labeled <- tree
+tree_labeled$tip.label <- lab
+
+# ---------- PDF (big, crisp) ----------
+pdf("cytb_nj_samples_by_species_legible148.pdf", width = 14, height = 18, family = "Helvetica")
+par(mar = c(1, 1, 1, 6), xpd = NA)  # extra right margin for legend
+plot(tree_labeled,
+     type = "fan",
+     tip.color = tip_cols,
+     edge.color = "grey85",
+     cex = 0.55,
+     no.margin = TRUE,
+     label.offset = 0.003,
+     ladderize = TRUE)
+legend("right", inset = -0.02, title = "Predicted species",
+       legend = names(sp_cols), col = sp_cols, pch = 19,
+       cex = 0.85, bty = "n")
 dev.off()
 
-# 2) Color unknowns by predicted species
-sp_levels <- sort(unique(na.omit(nearest$pred_species)))
-cols <- setNames(rainbow(length(sp_levels)), sp_levels)   # pick any palette you like
-tip_cols <- rep("black", length(tree$tip.label))
-tip_cols[id_in_tree[ok]] <- cols[nearest$pred_species[ok]]
-
-pdf("cytb_nj_tree_colored.pdf", width = 8.5, height = 11)
-plot(tree, tip.color = tip_cols, cex = 0.55)
-legend("topleft", legend = names(cols), col = cols, pch = 19, cex = 0.6, bty = "n")
-title("Unknowns colored by predicted species")
+# ---------- PNG (for slides/reports) ----------
+png("cytb_nj_samples_by_species_legible148.png", width = 2400, height = 2800, res = 300)
+par(mar = c(1, 1, 1, 6), xpd = NA)
+plot(tree_labeled,
+     type = "fan",
+     tip.color = tip_cols,
+     edge.color = "grey85",
+     cex = 0.55,
+     no.margin = TRUE,
+     label.offset = 0.003,
+     ladderize = TRUE)
+legend("right", inset = -0.02, title = "Predicted species",
+       legend = names(sp_cols), col = sp_cols, pch = 19,
+       cex = 0.85, bty = "n")
 dev.off()
 
-# 3) Representatives-only tree (keep all references + best unknown per species)
-rep_ix <- tapply(seq_len(nrow(nearest))[ok], nearest$pred_species[ok],
-                 function(ii) ii[ which.max(nearest$pct_identity[ii]) ])
-rep_ix <- unlist(rep_ix, use.names = FALSE)
+cat("Wrote: cytb_nj_samples_by_species_legible.pdf and .png\n")
 
-keep_names <- c(
-  names(combined_aln)[is_known],
-  nearest$unknown[rep_ix]
-)
 
-tree_small <- keep.tip(tree, keep_names)
 
-pdf("cytb_nj_tree_representatives.pdf", width = 8.5, height = 11)
-plot(tree_small, cex = 0.7)
-title("References + one best unknown per predicted species")
+
+# ---- 6) NJ tree (Option 1 figure: samples labeled & colored; refs grey) ----
+tree <- ape::njs(as.dist(dist_mat))
+
+# Map each sample (unknown) onto the tree
+idx <- match(nearest$unknown, tree$tip.label)
+present <- !is.na(idx)
+
+# Labels: ONLY show sample names; references appear without labels
+lab <- rep("", length(tree$tip.label))
+lab[idx[present]] <- nearest$unknown[present]
+
+# Colors: references light grey; samples colored by predicted species
+sp_order <- names(sort(table(nearest$pred_species[present]), decreasing = TRUE))
+# Color-blind friendly palette; recycle if needed
+okabe_ito <- c("#000000","#E69F00","#56B4E9","#009E73",
+               "#F0E442","#0072B2","#D55E00","#CC79A7","#999999")
+pal <- rep(okabe_ito, length.out = length(sp_order))
+sp_cols <- setNames(pal, sp_order)
+
+tip_cols <- rep("grey75", length(tree$tip.label))
+tip_cols[idx[present]] <- sp_cols[ nearest$pred_species[present] ]
+
+tree_labeled <- tree
+tree_labeled$tip.label <- lab
+
+# ---- Export PDF (big, crisp) ----
+pdf("cytb_nj_samples_by_species_legible148.pdf", width = 14, height = 18, family = "Helvetica")
+par(mar = c(1, 1, 1, 6), xpd = NA)  # extra right margin for legend
+plot(tree_labeled,
+     type = "fan",
+     tip.color = tip_cols,
+     edge.color = "grey88",
+     cex = 0.58,           # tweak up/down if crowded
+     label.offset = 0.006, # spacing between label and tip
+     no.margin = TRUE,
+     ladderize = TRUE)
+legend("right", inset = -0.02, title = "Predicted species",
+       legend = names(sp_cols), col = sp_cols, pch = 19,
+       cex = 0.9, bty = "n")
+dev.off()
+
+# ---- Export PNG (for slides/reports) ----
+png("cytb_nj_samples_by_species_legible148.png", width = 2400, height = 2800, res = 300)
+par(mar = c(1, 1, 1, 6), xpd = NA)
+plot(tree_labeled,
+     type = "fan",
+     tip.color = tip_cols,
+     edge.color = "grey88",
+     cex = 0.58,
+     label.offset = 0.006,
+     no.margin = TRUE,
+     ladderize = TRUE)
+legend("right", inset = -0.02, title = "Predicted species",
+       legend = names(sp_cols), col = sp_cols, pch = 19,
+       cex = 0.9, bty = "n")
+dev.off()
+
+message("Wrote: cytb_nj_samples_by_species_legible.pdf and .png")
+# ==========================================================================
+
+
+# Re-use the same 'lab', 'tip_cols', and 'tree_labeled' objects you built earlier
+
+pdf("cytb_nj_samples_by_species_legible_300.pdf", width = 14, height = 18, family = "Helvetica")
+par(mar = c(1, 1, 1, 8), xpd = NA)  # wider right margin for legend
+plot(tree_labeled,
+     type = "fan",
+     open.angle = 330,     # leave a clean gap for the legend
+     rotate.tree = 90,     # rotate to place the dense cluster away from legend
+     tip.color = tip_cols,
+     edge.color = "grey88",
+     cex = 0.60,           # slightly larger text; drop to 0.55 if crowded
+     label.offset = 0.008, # push labels out a bit more
+     no.margin = TRUE,
+     ladderize = TRUE)
+legend("right", inset = -0.02, title = "Predicted species",
+       legend = names(sp_cols), col = sp_cols, pch = 19,
+       cex = 0.9, bty = "n", ncol = 2)
 dev.off()
 
