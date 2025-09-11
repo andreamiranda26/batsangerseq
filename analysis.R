@@ -586,3 +586,272 @@ print(dd %>% group_by(frame, tier) %>% summarise(n = n(), .groups = "drop"))
 #   1 148-bp mini-barcode STRONG          39
 # 2 148-bp mini-barcode SUGGESTIVE         1
 # 3 148-bp mini-barcode WEAK/AMBIGUOUS    11
+
+
+
+# ==================== 300-bp view (same primer offset strategy as 148) ====================
+
+# --- parameters that mirror your 148 block ---
+align_trim_start <- 23     # same primer offset as 148-bp view
+len_frame        <- 300    # 300-bp window for the sensitivity view
+trim_len_long    <- 550    # keep more from raw reads so a 300-bp crop is possible
+folder           <- "data/cytb"  # where your .ab1 files are
+outgroup_fa   <- "cytb_outgroup.fasta"          # your single-sequence FASTA
+outgroup_hint <- "^Glossophaga soricina$"       # or "^Artibeus jamaicensis$"
+
+
+# --- (re)read chromatograms with a longer hard-trim, align unknowns alone, crop to 300 bp ---
+ab1_files <- list.files(folder, pattern = "\\.ab1$", full.names = TRUE)
+stopifnot("No .ab1 files found" = length(ab1_files) > 0)
+
+seqs_long <- setNames(vector("list", length(ab1_files)),
+                      tools::file_path_sans_ext(basename(ab1_files)))
+for (i in seq_along(ab1_files)) {
+  abif <- sangerseqR::read.abif(ab1_files[i])
+  s    <- sangerseqR::sangerseq(abif)
+  raw  <- toupper(as.character(sangerseqR::primarySeq(s)))
+  seqs_long[[i]] <- Biostrings::DNAString(substr(raw, 1, min(trim_len_long, nchar(raw))))
+}
+unknowns_raw_long <- Biostrings::DNAStringSet(seqs_long)
+Biostrings::writeXStringSet(unknowns_raw_long, "trimmed_550.fasta")
+
+unknowns_aln_long <- DECIPHER::AlignSeqs(unknowns_raw_long, verbose = FALSE)
+
+# crop at the SAME primer offset as before, but to 300 nt (short reads will be <300; that's OK)
+unknowns_300 <- Biostrings::subseq(
+  unknowns_aln_long,
+  start = align_trim_start,
+  width = len_frame
+)
+
+# --- make sure refs MSA exists (from your 148 block); if not, build it quickly ---
+if (!exists("knowns_AL_aln")) {
+  knowns_raw <- Biostrings::readDNAStringSet("cytb_known_batseqs.fasta")
+  knowns_raw <- Biostrings::DNAStringSet(gsub("-", "", as.character(knowns_raw), fixed = TRUE))
+  # subset to your Alabama accession list (same as you used for 148)
+  wanted_acc <- c(
+    "AF376835.1","MF038479.1","EU350026.1","EU350025.1","KC747682.1",
+    "KP341708.1","KP341709.1","KP341731.1","KP341713.1","KC747687.1",
+    "KP341748.1","KP341753.1","KP341751.1","AM261885.1","AM261892.1",
+    "OM160895.1","OM160889.1","DQ503551.1","AM262335.1","OP157144.1",
+    "KC747697.1","AJ504449.1","MF135779.1","MF135770.1"
+  )
+  all_acc <- sub("\\s.*$", "", names(knowns_raw))
+  keep_idx <- match(wanted_acc[wanted_acc %in% all_acc], all_acc)
+  knowns_sel <- knowns_raw[keep_idx]
+  knowns_AL_aln <- DECIPHER::AlignSeqs(knowns_sel, verbose = FALSE)
+}
+
+# --- combine: preserve the 300-bp window by profile-to-profile alignment ---
+if ("AlignProfiles" %in% getNamespaceExports("DECIPHER")) {
+  combined_300_AL <- tryCatch(
+    DECIPHER::AlignProfiles(unknowns_300, knowns_AL_aln),
+    error = function(e) DECIPHER::AlignSeqs(c(unknowns_300, DECIPHER::RemoveGaps(knowns_AL_aln)), verbose = FALSE)
+  )
+} else {
+  combined_300_AL <- DECIPHER::AlignSeqs(c(unknowns_300, DECIPHER::RemoveGaps(knowns_AL_aln)), verbose = FALSE)
+}
+is_unknown_AL_300 <- names(combined_300_AL) %in% names(unknowns_300)
+
+# --- %-identity + nearest matches (uses the same helper functions as your 148 block) ---
+if (!exists("pid_matrix_from_alignment")) {
+  pid_matrix_from_alignment <- function(aln) {
+    bases <- c("A","C","G","T")
+    nm <- names(aln)
+    M <- do.call(rbind, strsplit(as.character(aln), ""))
+    M <- toupper(M); rownames(M) <- nm
+    n <- nrow(M)
+    pid <- matrix(NA_real_, n, n, dimnames = list(nm, nm))
+    valid_counts <- matrix(0L, n, n, dimnames = list(nm, nm))
+    if (n >= 2) for (i in 1:(n-1)) for (j in (i+1):n) {
+      mask <- (M[i,] %in% bases) & (M[j,] %in% bases)
+      comp <- sum(mask); valid_counts[i,j] <- valid_counts[j,i] <- comp
+      if (comp > 0) pid[i,j] <- pid[j,i] <- (sum(M[i,mask]==M[j,mask])/comp)*100
+    }
+    diag(pid) <- 100; diag(valid_counts) <- ncol(M)
+    list(pid=pid, valid=valid_counts)
+  }
+}
+if (!exists("nearest_table")) {
+  nearest_table <- function(pid, valid, is_unknown) {
+    seq_names <- rownames(pid)
+    dist_mat <- 1 - pid/100; dist_mat[is.na(dist_mat)] <- 1; diag(dist_mat) <- 0
+    if (is.logical(is_unknown) && length(is_unknown) == length(seq_names)) {
+      unknown_ids <- seq_names[is_unknown]
+    } else if (is.character(is_unknown)) unknown_ids <- intersect(seq_names, is_unknown)
+    else if (is.numeric(is_unknown)) unknown_ids <- seq_names[is_unknown]
+    else stop("nearest_table(): is_unknown must align to pid dimnames.")
+    known_ids <- setdiff(seq_names, unknown_ids)
+    do.call(rbind, lapply(unknown_ids, function(u){
+      drow <- dist_mat[u, known_ids]; vrow <- valid[u, known_ids]
+      ok <- !is.na(drow) & vrow > 0
+      if (!any(ok)) return(data.frame(unknown=u,best_known=NA,dist=NA,pct_identity=NA,
+                                      second_best_dist=NA,second_best_pct_identity=NA,
+                                      gap_to_second_pct=NA, stringsAsFactors=FALSE))
+      ord <- order(drow[ok]); k_ok <- names(drow[ok])
+      best <- k_ok[ord[1]]; d1 <- drow[ok][ord[1]]; pi1 <- (1-d1)*100
+      if (length(ord) >= 2) { d2 <- drow[ok][ord[2]]; pi2 <- (1-d2)*100; gap <- pi1 - pi2
+      } else { d2 <- NA; pi2 <- NA; gap <- NA }
+      data.frame(unknown=u, best_known=best,
+                 dist=round(d1,5), pct_identity=round(pi1,2),
+                 second_best_dist=ifelse(is.na(d2),NA,round(d2,5)),
+                 second_best_pct_identity=ifelse(is.na(pi2),NA,round(pi2,2)),
+                 gap_to_second_pct=ifelse(is.na(gap),NA,round(gap,2)),
+                 stringsAsFactors=FALSE)
+    }))
+  }
+}
+if (!exists("extract_species")) {
+  extract_species <- function(x){
+    sapply(x, function(xx){
+      m1 <- regexec("^[^ ]+\\s+([A-Z][a-z]+\\s+[a-z]+)", xx); g1 <- regmatches(xx, m1)[[1]]
+      if (length(g1) >= 2) return(g1[2])
+      m2 <- regexec("^([A-Z][a-z]+\\s+[a-z]+)", xx); g2 <- regmatches(xx, m2)[[1]]
+      if (length(g2) >= 2) return(g2[2])
+      NA_character_
+    })
+  }
+}
+
+pm_300_AL <- pid_matrix_from_alignment(combined_300_AL)
+
+# sanity: do unknowns overlap references at 300?
+unk_ids <- names(combined_300_AL)[is_unknown_AL_300]
+ref_ids <- names(combined_300_AL)[!is_unknown_AL_300]
+vc <- pm_300_AL$valid[unk_ids, ref_ids, drop = FALSE]
+cat("300-bp view — valid sites per unknown/reference pair:",
+    "min =", suppressWarnings(min(vc, na.rm = TRUE)),
+    "median =", suppressWarnings(median(vc, na.rm = TRUE)), "\n")
+
+nearest_300_AL <- nearest_table(pm_300_AL$pid, pm_300_AL$valid, is_unknown_AL_300)
+nearest_300_AL$pred_species <- extract_species(nearest_300_AL$best_known)
+
+# vectorized rubric (>=90 strong, >=80 suggestive)
+call_from_pid_vec <- function(x){
+  out <- rep("WEAK/AMBIGUOUS", length(x))
+  out[is.na(x)] <- "UNRESOLVED"
+  out[!is.na(x) & x >= 80] <- "SUGGESTIVE"
+  out[!is.na(x) & x >= 90] <- "STRONG"
+  out
+}
+nearest_300_AL$call_strength <- call_from_pid_vec(nearest_300_AL$pct_identity)
+write.csv(nearest_300_AL, "cytb_unknown_best_matches300.csv", row.names = FALSE)
+cat("Wrote: cytb_unknown_best_matches300.csv\n")
+
+# --- rectangular trees (reuse your plotting helpers) ---
+D300_AL <- 1 - pm_300_AL$pid/100; D300_AL[is.na(D300_AL)] <- 1; diag(D300_AL) <- 0
+tree_300_AL <- ape::njs(as.dist(D300_AL))
+
+if (file.exists(outgroup_fa)) {
+  og_raw <- Biostrings::readDNAStringSet(outgroup_fa)
+  # normalize header so it looks like "Genus species"
+  if (length(og_raw) >= 1) {
+    nm <- names(og_raw)[1]
+    nm2 <- sub("^.*([A-Z][a-z]+)[ _]([a-z]+).*$", "\\1 \\2", nm)
+    if (!grepl("^[A-Z][a-z]+\\s+[a-z]+$", nm2)) nm2 <- "Glossophaga soricina"
+    names(og_raw)[1] <- nm2
+  }
+  if ("AlignProfiles" %in% getNamespaceExports("DECIPHER")) {
+    combined_for_tree300 <- tryCatch(
+      DECIPHER::AlignProfiles(combined_300_AL, og_raw),
+      error = function(e) DECIPHER::AlignSeqs(c(combined_300_AL, og_raw), verbose = FALSE)
+    )
+  } else {
+    combined_for_tree300 <- DECIPHER::AlignSeqs(c(combined_300_AL, og_raw), verbose = FALSE)
+  }
+  is_unknown_tree300 <- c(is_unknown_AL_300, rep(FALSE, length(og_raw)))
+  tip_names_tree300  <- c(names(combined_300_AL), names(og_raw))
+  if (!identical(names(combined_for_tree300), tip_names_tree300)) {
+    names(combined_for_tree300) <- tip_names_tree300
+  }
+  pm_tree300 <- pid_matrix_from_alignment(combined_for_tree300)
+  D_tree300  <- 1 - pm_tree300$pid/100; D_tree300[is.na(D_tree300)] <- 1; diag(D_tree300) <- 0
+  tree_for_plot300 <- ape::njs(as.dist(D_tree300))
+  
+  plot_rect_full_148(
+    tree_for_plot300, D_tree300, nearest_300_AL, is_unknown_tree300,
+    tip_labels_original = tip_names_tree300,
+    out_stub = "cytb_rect_full_300_AL_with_external_outgroup",
+    outgroup_hint = outgroup_hint, direction = "rightwards", label_refs = TRUE
+  )
+  plot_rect_reduced_148(
+    tree_for_plot300, D_tree300, nearest_300_AL, is_unknown_tree300,
+    tip_labels_original = tip_names_tree300,
+    out_stub = "cytb_rect_reduced_300_AL_with_external_outgroup",
+    outgroup_hint = outgroup_hint, direction = "rightwards"
+  )
+} else {
+  message("NOTE: outgroup FASTA not found for 300-bp tree; rooting within AL references.")
+  plot_rect_full_148(
+    tree_300_AL, D300_AL, nearest_300_AL, is_unknown_AL_300,
+    tip_labels_original = names(combined_300_AL),
+    out_stub = "cytb_rect_full_300_AL",
+    outgroup_hint = outgroup_hint, direction = "rightwards", label_refs = TRUE
+  )
+  plot_rect_reduced_148(
+    tree_300_AL, D300_AL, nearest_300_AL, is_unknown_AL_300,
+    tip_labels_original = names(combined_300_AL),
+    out_stub = "cytb_rect_reduced_300_AL",
+    outgroup_hint = outgroup_hint, direction = "rightwards"
+  )
+}
+
+# ==================== 148 vs 300 comparison plots ====================
+if (!requireNamespace("ggplot2", quietly = TRUE)) install.packages("ggplot2")
+if (!requireNamespace("dplyr", quietly = TRUE))   install.packages("dplyr")
+library(ggplot2); library(dplyr)
+
+d148 <- nearest_148_AL %>%
+  transmute(sample = unknown,
+            frame  = "148-bp mini-barcode",
+            pct_identity,
+            margin = gap_to_second_pct,
+            tier   = call_from_pid_vec(pct_identity))
+
+d300 <- nearest_300_AL %>%
+  transmute(sample = unknown,
+            frame  = "~300-bp reference-anchored frame",
+            pct_identity,
+            margin = gap_to_second_pct,
+            tier   = call_from_pid_vec(pct_identity))
+
+dd <- bind_rows(d148, d300)
+
+p_hist <- ggplot(dd %>% filter(!is.na(margin)), aes(x = margin)) +
+  geom_histogram(bins = 25, color = "white") +
+  facet_wrap(~ frame, ncol = 2, scales = "free_y") +
+  geom_vline(xintercept = 0.5, linetype = "dashed") +
+  geom_vline(xintercept = 1.0, linetype = "dotted") +
+  labs(title = "Margin (best − second-best) distributions",
+       x = "Margin to second-best (percentage points)",
+       y = "Count") +
+  theme_classic(base_size = 12)
+
+ggsave("plots_margin_hist.pdf", p_hist, width = 8.5, height = 4.4)
+ggsave("plots_margin_hist.png", p_hist, width = 8.5, height = 4.4, dpi = 300)
+
+p_scatter <- ggplot(dd %>% filter(!is.na(margin)),
+                    aes(x = pct_identity, y = margin, color = tier)) +
+  geom_point(size = 2, alpha = 0.85) +
+  facet_wrap(~ frame, ncol = 2) +
+  scale_color_manual(values = c(
+    "STRONG" = "#1b9e77",
+    "SUGGESTIVE" = "#7570b3",
+    "WEAK/AMBIGUOUS" = "#d95f02",
+    "UNRESOLVED" = "grey50"
+  ), drop = FALSE) +
+  geom_vline(xintercept = 80, linetype = "dashed") +
+  geom_vline(xintercept = 90, linetype = "solid") +
+  geom_hline(yintercept = 0.5, linetype = "dashed") +
+  geom_hline(yintercept = 1.0, linetype = "dotted") +
+  labs(title = "Percent identity vs margin",
+       x = "Percent identity (%)",
+       y = "Margin to second-best (percentage points)",
+       color = "Confidence (≥90% = STRONG)") +
+  theme_classic(base_size = 12)
+
+ggsave("plots_identity_vs_margin.pdf", p_scatter, width = 9.5, height = 4.8)
+ggsave("plots_identity_vs_margin.png", p_scatter, width = 9.5, height = 4.8, dpi = 300)
+
+print(dd %>% group_by(frame, tier) %>% summarise(n = n(), .groups = "drop"))
+# ===========================================================================================
