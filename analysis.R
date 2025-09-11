@@ -21,7 +21,7 @@ trim_len_raw     <- 170                         # hard trim of raw reads
 align_trim_start <- 23                          # drop first 22 bases (primer/poly-A)
 len_mini         <- 148                         # 148-bp mini-barcode
 known_seq_file   <- "cytb_known_batseqs.fasta"  # your reference panel (multi-FASTA)
-outgroup_fa  <- "cytb_outgroup.fasta"  # your A. jamaicensis cytb FASTA (single sequence)
+outgroup_fa  <- "cytb_outgroup.fasta"  # cytb FASTA (single sequence)
 # Force rooting by name pattern:
 outgroup_hint <- "^Glossophaga soricina$" 
 
@@ -854,4 +854,186 @@ ggsave("plots_identity_vs_margin.pdf", p_scatter, width = 9.5, height = 4.8)
 ggsave("plots_identity_vs_margin.png", p_scatter, width = 9.5, height = 4.8, dpi = 300)
 
 print(dd %>% group_by(frame, tier) %>% summarise(n = n(), .groups = "drop"))
+
+# # A tibble: 6 × 3
+# frame                            tier               n
+# <chr>                            <chr>          <int>
+#   1 148-bp mini-barcode              STRONG            39
+# 2 148-bp mini-barcode              SUGGESTIVE         1
+# 3 148-bp mini-barcode              WEAK/AMBIGUOUS    11
+# 4 ~300-bp reference-anchored frame STRONG            33
+# 5 ~300-bp reference-anchored frame SUGGESTIVE         6
+# 6 ~300-bp reference-anchored frame WEAK/AMBIGUOUS    12
 # ===========================================================================================
+
+
+
+# ---- Summaries for 148-bp and ~300-bp runs (with margin ranges) ---------
+
+# Helper: get a data frame either from the workspace or from a CSV on disk
+get_df <- function(obj_name, csv_path) {
+  if (exists(obj_name, inherits = TRUE)) {
+    get(obj_name, inherits = TRUE)
+  } else {
+    stopifnot("Missing file: {csv_path}" = file.exists(csv_path))
+    read.csv(csv_path, stringsAsFactors = FALSE)
+  }
+}
+
+# Safe range that tolerates all-NA vectors
+safe_range <- function(x) {
+  if (all(is.na(x))) c(NA_real_, NA_real_) else range(x, na.rm = TRUE)
+}
+
+# Format to 2 decimals
+fmt2 <- function(x) sprintf("%.2f", x)
+
+# Print the sentence for a given results data frame
+print_summary <- function(df, label_text) {
+  # expects columns: pct_identity, gap_to_second_pct
+  r_pi  <- safe_range(df$pct_identity)
+  r_mg  <- safe_range(df$gap_to_second_pct)
+  med_pi <- median(df$pct_identity, na.rm = TRUE)
+  med_mg <- median(df$gap_to_second_pct, na.rm = TRUE)
+  
+  cat(
+    sprintf(
+      "Under the %s, percent identity ranged %s–%s%% (median %s%%), and the margin to the second-best match ranged %s–%s percentage points (median %s).\n",
+      label_text, fmt2(r_pi[1]), fmt2(r_pi[2]), fmt2(med_pi),
+      fmt2(r_mg[1]), fmt2(r_mg[2]), fmt2(med_mg)
+    )
+  )
+}
+
+# 148-bp
+df148 <- get_df("nearest_148_AL", "cytb_unknown_best_matches148.csv")
+print_summary(df148, "148-bp mini-barcode")
+
+#Under the 148-bp mini-barcode, percent identity ranged 38.32–97.27% (median 92.50%), 
+#and the margin to the second-best match ranged 0.00–6.67 percentage points (median 3.08).
+
+# 300-bp
+df300 <- get_df("nearest_300_AL", "cytb_unknown_best_matches300.csv")
+print_summary(df300, "300-bp reference-anchored frame")
+#Under the 300-bp reference-anchored frame, percent identity ranged 43.10–97.89% (median 92.86%), 
+#and the margin to the second-best match ranged 0.00–13.06 percentage points (median 5.62). 
+
+
+
+# ==================== Paired per-sample comparison: 148 vs ~300 ====================
+
+if (!requireNamespace("dplyr", quietly = TRUE)) install.packages("dplyr")
+library(dplyr)
+
+# -- helpers -----------------------------------------------------------------------
+get_df <- function(obj_name, csv_path) {
+  if (exists(obj_name, inherits = TRUE)) {
+    get(obj_name, inherits = TRUE)
+  } else {
+    stopifnot("Missing file: {csv_path}" = file.exists(csv_path))
+    read.csv(csv_path, stringsAsFactors = FALSE)
+  }
+}
+
+# Vectorized confidence rubric: STRONG >=90, SUGGESTIVE >=80, else WEAK/AMBIGUOUS
+call_from_pid_vec <- function(x) {
+  out <- rep("WEAK/AMBIGUOUS", length(x))
+  out[is.na(x)] <- "UNRESOLVED"
+  out[!is.na(x) & x >= 80] <- "SUGGESTIVE"
+  out[!is.na(x) & x >= 90] <- "STRONG"
+  out
+}
+
+# Safe species extractor (works if pred_species absent)
+extract_species <- function(x) {
+  vapply(x, function(xx) {
+    if (is.na(xx) || !nzchar(xx)) return(NA_character_)
+    m1 <- regexec("^[^ ]+\\s+([A-Z][a-z]+\\s+[a-z]+)", xx); g1 <- regmatches(xx, m1)[[1]]
+    if (length(g1) >= 2) return(g1[2])
+    m2 <- regexec("^([A-Z][a-z]+\\s+[a-z]+)", xx); g2 <- regmatches(xx, m2)[[1]]
+    if (length(g2) >= 2) return(g2[2])
+    NA_character_
+  }, character(1))
+}
+
+# -- load results ------------------------------------------------------------------
+df148 <- get_df("nearest_148_AL", "cytb_unknown_best_matches148.csv")
+df300 <- get_df("nearest_300_AL", "cytb_unknown_best_matches300.csv")
+
+# Be robust to presence/absence of pred_species
+if (!"pred_species" %in% names(df148)) df148$pred_species <- extract_species(df148$best_known)
+if (!"pred_species" %in% names(df300)) df300$pred_species <- extract_species(df300$best_known)
+
+# Add tiers (recompute to be sure thresholds match)
+df148$tier <- call_from_pid_vec(df148$pct_identity)
+df300$tier <- call_from_pid_vec(df300$pct_identity)
+
+# -- pair by sample id -------------------------------------------------------------
+cmp <- df148 %>%
+  transmute(sample = unknown,
+            species_148 = pred_species,
+            pct_148 = pct_identity,
+            margin_148 = gap_to_second_pct,
+            tier_148 = tier) %>%
+  inner_join(
+    df300 %>%
+      transmute(sample = unknown,
+                species_300 = pred_species,
+                pct_300 = pct_identity,
+                margin_300 = gap_to_second_pct,
+                tier_300 = tier),
+    by = "sample"
+  ) %>%
+  mutate(
+    delta_pct    = pct_300 - pct_148,
+    delta_margin = margin_300 - margin_148,
+    # tier change (+1 means improved, -1 declined)
+    tier_rank_148 = match(tier_148, c("WEAK/AMBIGUOUS","SUGGESTIVE","STRONG")),
+    tier_rank_300 = match(tier_300, c("WEAK/AMBIGUOUS","SUGGESTIVE","STRONG")),
+    delta_tier    = tier_rank_300 - tier_rank_148,
+    tier_change   = dplyr::case_when(
+      is.na(delta_tier)              ~ "Unknown",
+      delta_tier > 0                 ~ "Improved",
+      delta_tier < 0                 ~ "Declined",
+      TRUE                           ~ "Unchanged"
+    ),
+    species_switched = ifelse(is.na(species_148) | is.na(species_300),
+                              NA, species_148 != species_300),
+    near_tie_148 = ifelse(is.na(margin_148), NA, margin_148 < 1)  # <1 pp in 148-bp run
+  )
+
+# Write the per-sample comparison table
+write.csv(cmp, "paired_comparison_148_vs_300.csv", row.names = FALSE)
+
+# -- summaries  -------------------------------------------------------
+n <- nrow(cmp)
+more_margin <- sum(cmp$delta_margin > 0, na.rm = TRUE)
+less_margin <- sum(cmp$delta_margin < 0, na.rm = TRUE)
+same_margin <- sum(cmp$delta_margin == 0, na.rm = TRUE)
+
+tab_tier <- table(cmp$tier_change, useNA = "no")
+improved <- unname(tab_tier["Improved"]); if (is.na(improved)) improved <- 0
+declined <- unname(tab_tier["Declined"]); if (is.na(declined)) declined <- 0
+unchanged <- unname(tab_tier["Unchanged"]); if (is.na(unchanged)) unchanged <- 0
+
+switched <- sum(cmp$species_switched %in% TRUE, na.rm = TRUE)
+switched_with_gain <- sum(cmp$species_switched %in% TRUE & cmp$delta_pct > 0, na.rm = TRUE)
+switched_near_tie_148 <- sum(cmp$species_switched %in% TRUE & (cmp$near_tie_148 %in% TRUE), na.rm = TRUE)
+
+cat(sprintf(
+  "\nPAIRED SUMMARY (n = %d):\n", n))
+cat(sprintf(" • Margin larger in ~300 for %d/%d samples (%.1f%%); smaller for %d; unchanged for %d.\n",
+            more_margin, n, 100*more_margin/n, less_margin, same_margin))
+cat(sprintf(" • Confidence tier changes — Improved: %d, Declined: %d, Unchanged: %d.\n",
+            improved, declined, unchanged))
+cat(sprintf(" • Species switches: %d/%d samples; of those, %d had higher %% identity in ~300; %d were near-ties (<1 pp margin) in the 148-bp run.\n\n",
+            switched, n, switched_with_gain, switched_near_tie_148))
+
+# Optional: tier transition matrix (contingency table)
+tier_matrix <- table(From_148 = cmp$tier_148, To_300 = cmp$tier_300)
+print(tier_matrix)
+
+# Optional: quick glance at largest improvements/declines
+head(arrange(cmp, desc(delta_margin))[, c("sample","species_148","species_300","pct_148","pct_300","margin_148","margin_300","delta_margin","tier_148","tier_300")], 10)
+head(arrange(cmp, delta_margin)[, c("sample","species_148","species_300","pct_148","pct_300","margin_148","margin_300","delta_margin","tier_148","tier_300")], 10)
+
