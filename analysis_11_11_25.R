@@ -1,12 +1,12 @@
 # ==================== BAT CYTB — 148-bp & ~300-bp (NJ + bootstrap) ====================
-# Robust: align unknowns + refs together with AlignSeqs(); strip all '-' gaps first
-# Outputs:
-#   cytb_unknown_best_matches148.csv
-#   cytb_unknown_best_matches300.csv
-#   cytb_tree_full_148.{pdf,png}
-#   cytb_tree_full_300.{pdf,png}
-#   plots_margin_hist.{pdf,png}
-#   plots_identity_vs_margin.{pdf,png}
+# Clean, journal-ready outputs:
+#  - cytb_unknown_best_matches148.csv
+#  - cytb_unknown_best_matches300.csv
+#  - paired_comparison_148_vs_300.csv
+#  - cytb_tree_full_148.{pdf,png}  (unknowns colored by predicted species, refs gray, common names)
+#  - cytb_tree_full_300.{pdf,png}  (same styling)
+#  - plots_margin_hist.{pdf,png}
+#  - plots_identity_vs_margin.{pdf,png}  (only vline at 90%)
 # ================================================================================
 
 suppressPackageStartupMessages({
@@ -47,6 +47,7 @@ extract_species <- function(x) {
   })
 }
 
+# Scientific -> Common (includes both Perimyotis/Pipistrellus)
 SCI_TO_COMMON <- c(
   "Eptesicus fuscus"          = "Big brown bat",
   "Lasionycteris noctivagans" = "Silver-haired bat",
@@ -59,15 +60,34 @@ SCI_TO_COMMON <- c(
   "Myotis lucifugus"          = "Little brown bat",
   "Myotis septentrionalis"    = "Northern long-eared bat",
   "Nycticeius humeralis"      = "Evening bat",
-  # Historical vs current genus — both map to the same common name:
-  "Pipistrellus subflavus"    = "Tri-colored bat",
   "Perimyotis subflavus"      = "Tri-colored bat",
+  "Pipistrellus subflavus"    = "Tri-colored bat",
   "Tadarida brasiliensis"     = "Mexican free-tailed bat",
   "Glossophaga soricina"      = "Pallas’s long-tongued bat"
 )
 to_common <- function(species_vec) {
-  out <- unname(SCI_TO_COMMON[species_vec]); out[is.na(out)] <- species_vec; out
+  out <- unname(SCI_TO_COMMON[species_vec])
+  out[is.na(out)] <- species_vec
+  out
 }
+
+# Distinct color per *common-name* species for unknowns (12+ distinct hues)
+COMMON_PALETTE <- c(
+  "Big brown bat"            = "#1b9e77",
+  "Silver-haired bat"        = "#d95f02",
+  "Eastern red bat"          = "#7570b3",
+  "Hoary bat"                = "#e7298a",
+  "Northern yellow bat"      = "#66a61e",
+  "Seminole bat"             = "#e6ab02",
+  "Southeastern myotis"      = "#a6761d",
+  "Gray bat"                 = "#666666",
+  "Little brown bat"         = "#1f78b4",
+  "Northern long-eared bat"  = "#b2df8a",
+  "Evening bat"              = "#33a02c",
+  "Tri-colored bat"          = "#fb9a99",
+  "Mexican free-tailed bat"  = "#cab2d6"
+  # (Outgroup not colored here—references stay gray)
+)
 
 pid_matrix_from_alignment <- function(aln) {
   bases <- c("A","C","G","T")
@@ -143,56 +163,121 @@ bootstrap_nj_on_alignment <- function(aln, tree, B = 1000, seed = 1L) {
   ape::boot.phylo(tree, M, FUN = boot_fun, B = B)
 }
 
-plot_tree_common <- function(tree, is_unknown, out_stub, refs_common = NULL) {
-  tr <- tree
+# Plot: unknown tips colored by predicted species (common names); refs gray with common names
+plot_tree_colored <- function(tree, unknown_names, ref_common_map, unknown_to_common, out_stub) {
+  tr <- ape::ladderize(tree, right = TRUE)
+
+  # Build tip labels: refs -> common names; unknowns -> keep sample IDs
   labs <- tr$tip.label
-  if (!is.null(refs_common)) {
-    labs_new <- labs
-    labs_new[!is_unknown] <- refs_common[match(labs[!is_unknown], names(refs_common))]
-    labs_new[is.na(labs_new)] <- labs[is.na(labs_new)]
-    tr$tip.label <- labs_new
+  is_unknown <- labs %in% unknown_names
+  labs_new <- labs
+  labs_new[!is_unknown] <- ref_common_map[match(labs[!is_unknown], names(ref_common_map))]
+  labs_new[is.na(labs_new)] <- labs[is.na(labs_new)]
+  tr$tip.label <- labs_new
+
+  # Colors: unknowns colored by predicted species (common); refs gray
+  tip_cols <- rep("grey35", length(labs))
+  names(tip_cols) <- tr$tip.label
+  # Map unknown sample ID (original label before relabel) to species-common
+  # We need a vector aligned to current order: create lookup by original name
+  orig_lbl <- labs
+  for (i in seq_along(orig_lbl)) {
+    if (orig_lbl[i] %in% unknown_names) {
+      sp_common <- unknown_to_common[orig_lbl[i]]
+      if (!is.na(sp_common) && sp_common %in% names(COMMON_PALETTE)) {
+        tip_cols[i] <- COMMON_PALETTE[[sp_common]]
+      }
+    }
   }
+
+  # Legend: unique species present among unknowns
+  unk_sp_present <- unique(unknown_to_common[intersect(names(unknown_to_common), unknown_names)])
+  unk_sp_present <- unk_sp_present[!is.na(unk_sp_present)]
+  leg_cols <- COMMON_PALETTE[unk_sp_present]
+
+  # Plot with big right margin and legend outside the panel
   H <- max(ape::node.depth.edgelength(tr)); extend <- 1.18
   for (dev in c("pdf","png")) {
     if (dev=="pdf") pdf(paste0(out_stub,".pdf"), width=12, height=16, family="Helvetica")
     else             png(paste0(out_stub,".png"),  width=2200, height=3000, res=300)
-    par(mar=c(5,4,2,1))
+
+    par(mar=c(5,4,2,14), xpd=NA)  # extra right margin for legend
     plot(tr, type="phylogram", direction="rightwards",
-         tip.color=ifelse(is_unknown, "black", "grey35"),
-         edge.color="grey60", cex=max(0.45, min(0.9, 95/length(tr$tip.label))),
+         tip.color=tip_cols, edge.color="grey60",
+         cex=max(0.45, min(0.9, 95/length(tr$tip.label))),
          label.offset=0.006, no.margin=FALSE,
          x.lim=c(0, H*extend))
+
+    # Draw node bootstraps if present (>=70)
     bs <- attr(tr, "boot")
     if (!is.null(bs)) {
       bs_show <- ifelse(!is.na(bs) & bs >= 70, as.character(round(bs)), "")
       try(nodelabels(text = bs_show, frame = "none", cex = 0.6, col = "grey30"), silent = TRUE)
     }
-    legend("topleft", bty="n", cex=0.9,
+
+    # Legends (species and tip types) placed in right outer margin
+    usr <- par("usr")
+    x_leg <- usr[2] + (usr[2]-usr[1])*0.06
+    y_top <- usr[4]
+    if (length(unk_sp_present)) {
+      legend(x_leg, y_top, title="Unknowns: predicted species",
+             legend=unk_sp_present, col=leg_cols, pch=19,
+             bty="n", cex=0.9, xjust=0, yjust=1)
+    }
+    legend(x_leg, y_top - (usr[4]-usr[3])*0.25, title="Tip type",
            legend=c("Unknown sample","Reference"),
-           pch=c(19,1), col=c("black","grey40"))
+           pch=c(19,1), col=c("black","grey35"),
+           bty="n", cex=0.9, xjust=0, yjust=1)
+
     dev.off()
   }
 }
 
-# ---- 3) References ------------------------------------------------------------
+# ---- 3) References (Eumops glaucinus EXCLUDED) ----------------------------------
 stopifnot("Known FASTA not found" = file.exists(known_seq_file))
 knowns_raw <- readDNAStringSet(known_seq_file)
-knowns_sel <- remove_gaps(knowns_raw)  # ensure no gaps up front
+knowns_sel <- remove_gaps(knowns_raw)  # ensure no gaps
 
+# Alabama set (no Eumops glaucinus; also drop any Choeronycteris just in case)
 wanted_acc <- c(
-  "AF376835.1","MF038479.1","EU350026.1","EU350025.1","KC747682.1",
-  "KP341708.1","KP341709.1","KP341731.1","KP341713.1","KC747687.1",
-  "KP341748.1","KP341753.1","KP341751.1","AM261885.1","AM261892.1",
-  "OM160895.1","OM160889.1","DQ503551.1","AM262335.1",
-  "OP157144.1","KC747697.1","AJ504449.1","MF135779.1","MF135770.1"
+  # Eptesicus fuscus
+  "AF376835.1","MF038479.1",
+  # Lasionycteris noctivagans
+  "KC747682.1",
+  # Lasiurus borealis
+  "KP341708.1","KP341709.1",
+  # Lasiurus cinereus
+  "KP341731.1","KP341713.1",
+  # Lasiurus intermedius
+  "KC747687.1","KP341748.1",
+  # Lasiurus seminolus
+  "KP341753.1","KP341751.1",
+  # Myotis austroriparius
+  "AM261885.1",
+  # Myotis grisescens
+  "AM261892.1",
+  # Myotis lucifugus
+  "OM160895.1","OM160889.1",
+  # Myotis septentrionalis
+  "DQ503551.1","AM262335.1",
+  # Nycticeius humeralis
+  "OP157144.1","KC747697.1",
+  # Perimyotis/Pipistrellus subflavus
+  "AJ504449.1",
+  # Tadarida brasiliensis
+  "MF135779.1","MF135770.1"
 )
+
 all_acc <- sub("\\s.*$", "", names(knowns_sel))
 keep_idx <- match(wanted_acc[wanted_acc %in% all_acc], all_acc)
 knowns_sel <- knowns_sel[keep_idx]
-drop_ix <- grep("(^KC747677\\.1\\b)|Choeronycteris", names(knowns_sel), ignore.case = TRUE)
+
+# Safety drops
+drop_ix <- grep("(Choeronycteris|^KC747677\\.1\\b|Eumops\\s+glaucinus|EU350026\\.1|EU350025\\.1)", 
+                names(knowns_sel), ignore.case = TRUE)
 if (length(drop_ix)) knowns_sel <- knowns_sel[-drop_ix]
 
-# Map reference label -> species (for common names)
+# Map reference label -> species (common names)
 ref_species_all <- extract_species(names(knowns_sel))
 refs_common_map <- setNames(to_common(ref_species_all), names(knowns_sel))
 
@@ -209,21 +294,19 @@ make_window <- function(files, hard_trim, start, width) {
     lst[[i]] <- DNAString(substr(raw, 1, min(hard_trim, nchar(raw))))
   }
   unk_raw <- DNAStringSet(lst); names(unk_raw) <- nm
-  # Align unknowns to stabilize insertions/deletions, then crop window;
-  # this step introduces gaps, which we'll remove later before the joint alignment.
-  unk_aln <- DECIPHER::AlignSeqs(unk_raw, verbose = FALSE)
+  unk_aln <- DECIPHER::AlignSeqs(unk_raw, verbose = FALSE)  # stabilize indels
   Biostrings::subseq(unk_aln, start = start, width = width)
 }
 
 unknowns_148 <- make_window(ab1_files, trim_len_raw,  align_trim_start, len_mini)
 unknowns_300 <- make_window(ab1_files, trim_len_long, align_trim_start, len_frame)
 
-# ---- 5) STRIP GAPS before joint alignment (this fixes your error) --------------
+# Strip gaps before the joint alignment
 unknowns_148_ng <- remove_gaps(unknowns_148)
 unknowns_300_ng <- remove_gaps(unknowns_300)
-knowns_sel_ng   <- remove_gaps(knowns_sel)   # redundant but safe
+knowns_sel_ng   <- remove_gaps(knowns_sel)
 
-# ---- 6) Build joint alignments (unknowns + refs) --------------------------------
+# ---- 5) Joint alignments (unknowns + refs) --------------------------------------
 combined_148 <- DECIPHER::AlignSeqs(c(unknowns_148_ng, knowns_sel_ng), verbose = FALSE)
 combined_300 <- DECIPHER::AlignSeqs(c(unknowns_300_ng, knowns_sel_ng), verbose = FALSE)
 
@@ -232,7 +315,7 @@ ref_names_148 <- names(knowns_sel_ng)
 unk_names_300 <- names(unknowns_300_ng)
 ref_names_300 <- names(knowns_sel_ng)
 
-# ---- 7) Nearest matches (CSV) ---------------------------------------------------
+# ---- 6) Nearest matches (CSV) ---------------------------------------------------
 pm_148 <- pid_matrix_from_alignment(combined_148)
 nearest_148 <- nearest_table(pm_148$pid, pm_148$valid,
                              unknown_ids = unk_names_148,
@@ -249,8 +332,12 @@ nearest_300$pred_species  <- extract_species(nearest_300$best_known)
 nearest_300$call_strength <- call_from_pid_vec(nearest_300$pct_identity)
 write.csv(nearest_300, "cytb_unknown_best_matches300.csv", row.names = FALSE)
 
-# ---- 8) NJ trees + bootstrap (optional outgroup) --------------------------------
-build_tree_with_optional_outgroup <- function(combined_aln, out_stub){
+# For coloring: map unknown sample -> predicted species *common name*
+unknown_to_common_148 <- setNames(to_common(nearest_148$pred_species), nearest_148$unknown)
+unknown_to_common_300 <- setNames(to_common(nearest_300$pred_species), nearest_300$unknown)
+
+# ---- 7) NJ trees + bootstrap (optional outgroup) --------------------------------
+build_tree_with_optional_outgroup <- function(combined_aln){
   aln_for_tree <- combined_aln
   if (file.exists(outgroup_fa)) {
     og <- readDNAStringSet(outgroup_fa)
@@ -261,7 +348,6 @@ build_tree_with_optional_outgroup <- function(combined_aln, out_stub){
         if (!grepl("^[A-Z][a-z]+\\s+[a-z]+$", nm2)) "Glossophaga soricina" else nm2
       }
       og <- remove_gaps(og)
-      # Realign everything together for plotting
       aln_for_tree <- DECIPHER::AlignSeqs(c(remove_gaps(aln_for_tree), og), verbose = FALSE)
     }
   }
@@ -275,22 +361,20 @@ build_tree_with_optional_outgroup <- function(combined_aln, out_stub){
   tr <- ape::ladderize(tr, right = TRUE)
   bs <- bootstrap_nj_on_alignment(aln_for_tree, tr, B = 1000)
   attr(tr, "boot") <- bs
-  list(tree = tr)
+  tr
 }
 
-# 148 tree
-tree148 <- build_tree_with_optional_outgroup(combined_148, out_stub = "cytb_tree_full_148")$tree
-is_unknown_plot_148 <- tree148$tip.label %in% unk_names_148
-plot_tree_common(tree148, is_unknown_plot_148, out_stub = "cytb_tree_full_148",
-                 refs_common = setNames(to_common(extract_species(names(knowns_sel_ng))), names(knowns_sel_ng)))
+# Build trees
+tree148 <- build_tree_with_optional_outgroup(combined_148)
+tree300 <- build_tree_with_optional_outgroup(combined_300)
 
-# 300 tree
-tree300 <- build_tree_with_optional_outgroup(combined_300, out_stub = "cytb_tree_full_300")$tree
-is_unknown_plot_300 <- tree300$tip.label %in% unk_names_300
-plot_tree_common(tree300, is_unknown_plot_300, out_stub = "cytb_tree_full_300",
-                 refs_common = setNames(to_common(extract_species(names(knowns_sel_ng))), names(knowns_sel_ng)))
+# Plot trees (unknowns colored by predicted species; refs gray, labeled by common names)
+plot_tree_colored(tree148, unk_names_148, refs_common_map, unknown_to_common_148,
+                  out_stub = "cytb_tree_full_148")
+plot_tree_colored(tree300, unk_names_300, refs_common_map, unknown_to_common_300,
+                  out_stub = "cytb_tree_full_300")
 
-# ---- 9) Identity vs margin plots ----------------------------------------------
+# ---- 8) Identity vs margin plots ----------------------------------------------
 d148 <- nearest_148 %>%
   transmute(sample = unknown,
             frame  = "148-bp mini-barcode",
@@ -310,9 +394,7 @@ dd <- bind_rows(d148, d300)
 p_hist <- ggplot(dd %>% filter(!is.na(margin)), aes(x = margin)) +
   geom_histogram(bins = 25, color = "white") +
   facet_wrap(~ frame, ncol = 2, scales = "free_y") +
-  geom_vline(xintercept = 0.5, linetype = "dashed") +
-  geom_vline(xintercept = 1.0, linetype = "dotted") +
-  labs(title = "Margin (best − second-best) distributions",
+  labs(title = "Margin (best - second-best) distributions",
        x = "Margin to second-best (percentage points)",
        y = "Count") +
   theme_classic(base_size = 12)
@@ -329,10 +411,7 @@ p_scatter <- ggplot(dd %>% filter(!is.na(margin)),
     "WEAK/AMBIGUOUS" = "#d95f02",
     "UNRESOLVED" = "grey50"
   ), drop = FALSE) +
-  geom_vline(xintercept = 80, linetype = "dashed") +
-  geom_vline(xintercept = 90, linetype = "solid") +
-  geom_hline(yintercept = 0.5, linetype = "dashed") +
-  geom_hline(yintercept = 1.0, linetype = "dotted") +
+  geom_vline(xintercept = 90, linetype = "dashed") +  # only 90%
   labs(title = "Percent identity vs margin",
        x = "Percent identity (%)",
        y = "Margin to second-best (percentage points)",
@@ -341,92 +420,144 @@ p_scatter <- ggplot(dd %>% filter(!is.na(margin)),
 ggsave("plots_identity_vs_margin.pdf", p_scatter, width = 9.5, height = 4.8)
 ggsave("plots_identity_vs_margin.png", p_scatter, width = 9.5, height = 4.8, dpi = 300)
 
-# ==================== Paired per-sample comparison: 148 vs ~300 ====================
-
-# Helper to get an object if present, else load from CSV
+# ---- 9) Paired per-sample comparison: 148 vs ~300 --------------------------------
 get_df <- function(obj_name, csv_path) {
-  if (exists(obj_name, inherits = TRUE)) {
-    get(obj_name, inherits = TRUE)
-  } else {
-    stopifnot("Missing file: {csv_path}" = file.exists(csv_path))
-    read.csv(csv_path, stringsAsFactors = FALSE)
-  }
+  if (exists(obj_name, inherits = TRUE)) get(obj_name, inherits = TRUE)
+  else { stopifnot("Missing file: {csv_path}" = file.exists(csv_path))
+         read.csv(csv_path, stringsAsFactors = FALSE) }
 }
 
-# Ensure rubric function is available
-if (!exists("call_from_pid_vec")) {
-  call_from_pid_vec <- function(x){
-    out <- rep("WEAK/AMBIGUOUS", length(x))
-    out[is.na(x)] <- "UNRESOLVED"
-    out[!is.na(x) & x >= 80] <- "SUGGESTIVE"
-    out[!is.na(x) & x >= 90] <- "STRONG"
-    out
-  }
-}
-
-# Load results (from memory if available, else from disk)
 df148 <- get_df("nearest_148", "cytb_unknown_best_matches148.csv")
 df300 <- get_df("nearest_300", "cytb_unknown_best_matches300.csv")
 
-# Be robust to presence/absence of pred_species
-if (!"pred_species" %in% names(df148)) {
-  df148$pred_species <- extract_species(df148$best_known)
-}
-if (!"pred_species" %in% names(df300)) {
-  df300$pred_species <- extract_species(df300$best_known)
-}
-
-# Recompute tiers (just to be sure)
+if (!"pred_species" %in% names(df148)) df148$pred_species <- extract_species(df148$best_known)
+if (!"pred_species" %in% names(df300)) df300$pred_species <- extract_species(df300$best_known)
 df148$tier <- call_from_pid_vec(df148$pct_identity)
 df300$tier <- call_from_pid_vec(df300$pct_identity)
 
-# Pair by sample id (the 'unknown' column is the sample ID)
 paired <- dplyr::inner_join(
-  df148 %>% dplyr::transmute(sample = unknown,
-                             species_148 = pred_species,
-                             pct_148 = pct_identity,
-                             margin_148 = gap_to_second_pct,
-                             tier_148 = tier),
-  df300 %>% dplyr::transmute(sample = unknown,
-                             species_300 = pred_species,
-                             pct_300 = pct_identity,
-                             margin_300 = gap_to_second_pct,
-                             tier_300 = tier),
+  df148 %>% transmute(sample = unknown,
+                      species_148 = to_common(pred_species),
+                      pct_148 = pct_identity,
+                      margin_148 = gap_to_second_pct,
+                      tier_148 = tier),
+  df300 %>% transmute(sample = unknown,
+                      species_300 = to_common(pred_species),
+                      pct_300 = pct_identity,
+                      margin_300 = gap_to_second_pct,
+                      tier_300 = tier),
   by = "sample"
 ) %>%
-  dplyr::mutate(
+  mutate(
     delta_pct    = pct_300 - pct_148,
     delta_margin = margin_300 - margin_148,
     tier_rank_148 = match(tier_148, c("WEAK/AMBIGUOUS","SUGGESTIVE","STRONG")),
     tier_rank_300 = match(tier_300, c("WEAK/AMBIGUOUS","SUGGESTIVE","STRONG")),
     delta_tier    = tier_rank_300 - tier_rank_148,
-    tier_change   = dplyr::case_when(
-      is.na(delta_tier)      ~ "Unknown",
-      delta_tier > 0         ~ "Improved",
-      delta_tier < 0         ~ "Declined",
-      TRUE                   ~ "Unchanged"
+    tier_change   = case_when(
+      is.na(delta_tier) ~ "Unknown",
+      delta_tier > 0    ~ "Improved",
+      delta_tier < 0    ~ "Declined",
+      TRUE              ~ "Unchanged"
     ),
-    species_switched = dplyr::case_when(
-      is.na(species_148) | is.na(species_300) ~ NA,
-      TRUE                                    ~ species_148 != species_300
-    ),
-    near_tie_148 = ifelse(is.na(margin_148), NA, margin_148 < 1)  # <1 pp margin in 148-bp run
+    species_switched = ifelse(is.na(species_148) | is.na(species_300), NA, species_148 != species_300),
+    near_tie_148 = ifelse(is.na(margin_148), NA, margin_148 < 1)
   )
 
-# Write the table
 write.csv(paired, "paired_comparison_148_vs_300.csv", row.names = FALSE)
 
-# Brief console summary
+
+# ---- 10) Text-aligned summaries & reproduction checks -------------------------
+num_fmt <- function(x, d=2) ifelse(is.na(x), NA, format(round(x, d), nsmall=d))
+range_str <- function(v) paste0(num_fmt(min(v, na.rm=TRUE)), "–", num_fmt(max(v, na.rm=TRUE)))
+med_str   <- function(v) num_fmt(stats::median(v, na.rm=TRUE))
+
+# Ensure tiers exist
+if (!"tier" %in% names(df148)) df148$tier <- call_from_pid_vec(df148$pct_identity)
+if (!"tier" %in% names(df300)) df300$tier <- call_from_pid_vec(df300$pct_identity)
+
+# Helper: species composition (common names)
+species_comp <- function(df) {
+  sp <- to_common(df$pred_species)
+  sort(table(sp), decreasing = TRUE)
+}
+
+sink("results_reproduction_checks.txt")
+
+cat("\n=== 148-bp mini-barcode ===\n")
+cat("N unknowns with best match:", nrow(df148), "\n")
+cat("Percent identity range:", range_str(df148$pct_identity), "\n")
+cat("Percent identity median:", med_str(df148$pct_identity), "\n")
+cat("Margin (best-second) range:", range_str(df148$gap_to_second_pct), "\n")
+cat("Margin median:", med_str(df148$gap_to_second_pct), "\n")
+tab148 <- table(df148$tier, useNA = "no")
+cat("Confidence counts:", paste(paste(names(tab148), as.integer(tab148), sep="="), collapse=", "), "\n")
+cat("Species composition (common names):\n"); print(species_comp(df148))
+
+cat("\n=== ~300-bp reference-anchored frame ===\n")
+cat("N unknowns with best match:", nrow(df300), "\n")
+cat("Percent identity range:", range_str(df300$pct_identity), "\n")
+cat("Percent identity median:", med_str(df300$pct_identity), "\n")
+cat("Margin (best-second) range:", range_str(df300$gap_to_second_pct), "\n")
+cat("Margin median:", med_str(df300$gap_to_second_pct), "\n")
+tab300 <- table(df300$tier, useNA = "no")
+cat("Confidence counts:", paste(paste(names(tab300), as.integer(tab300), sep="="), collapse=", "), "\n")
+cat("Species composition (common names):\n"); print(species_comp(df300))
+
+cat("\n=== Paired per-sample comparisons (148 vs ~300) ===\n")
+n <- nrow(paired)
+cat("Total paired samples:", n, "\n")
+cat("Larger margin in ~300:", sum(paired$delta_margin > 0, na.rm=TRUE), "of", n, "\n")
+cat("Median per-sample Δmargin (pp):", med_str(paired$delta_margin), "\n")
+
+tab_change <- table(paired$tier_change, useNA="no")
+improved <- unname(tab_change["Improved"]); if (is.na(improved)) improved <- 0
+declined <- unname(tab_change["Declined"]); if (is.na(declined)) declined <- 0
+unchanged <- unname(tab_change["Unchanged"]); if (is.na(unchanged)) unchanged <- 0
+cat("Confidence tier changes — Improved:", improved, 
+    "Declined:", declined, "Unchanged:", unchanged, "\n")
+
+switched <- paired %>% filter(species_switched %in% TRUE)
+cat("Samples with top-species switch:", nrow(switched), "\n")
+if (nrow(switched)) {
+  cat("  with higher % identity in ~300:", sum(switched$delta_pct > 0, na.rm=TRUE), "\n")
+  cat("  that were near-ties (<1 pp) in 148:", sum(switched$near_tie_148 %in% TRUE, na.rm=TRUE), "\n")
+}
+
+cat("\n=== Near-ties in 148 (<1 pp) that gained separation in ~300 ===\n")
+near_ties <- paired %>% 
+  filter(!is.na(margin_148), margin_148 < 1, !is.na(margin_300), margin_300 > margin_148) %>%
+  arrange(sample)
+
+cat("Count:", nrow(near_ties), "\n")
+if (nrow(near_ties)) {
+  pretty_rows <- near_ties %>%
+    transmute(
+      sample,
+      species_148,
+      species_300,
+      margin_148 = num_fmt(margin_148, 2),
+      margin_300 = num_fmt(margin_300, 2),
+      pct_148 = num_fmt(pct_148, 2),
+      pct_300 = num_fmt(pct_300, 2)
+    )
+  print(pretty_rows, row.names = FALSE)
+}
+
+sink()
+
+cat("\nWrote a human-readable check file: results_reproduction_checks.txt\n")
+
+
+# Console summary
 n <- nrow(paired)
 more_margin <- sum(paired$delta_margin > 0, na.rm = TRUE)
 less_margin <- sum(paired$delta_margin < 0, na.rm = TRUE)
 same_margin <- sum(paired$delta_margin == 0, na.rm = TRUE)
-
 tab_tier <- table(paired$tier_change, useNA = "no")
 improved <- unname(tab_tier["Improved"]); if (is.na(improved)) improved <- 0
 declined <- unname(tab_tier["Declined"]); if (is.na(declined)) declined <- 0
 unchanged <- unname(tab_tier["Unchanged"]); if (is.na(unchanged)) unchanged <- 0
-
 switched <- sum(paired$species_switched %in% TRUE, na.rm = TRUE)
 switched_with_gain <- sum(paired$species_switched %in% TRUE & paired$delta_pct > 0, na.rm = TRUE)
 switched_near_tie_148 <- sum(paired$species_switched %in% TRUE & (paired$near_tie_148 %in% TRUE), na.rm = TRUE)
@@ -440,13 +571,12 @@ cat(sprintf(" • Confidence tier changes — Improved: %d, Declined: %d, Unchan
 cat(sprintf(" • Species switches: %d/%d samples; of those, %d had higher %% identity in ~300; %d were near-ties (<1 pp) in the 148-bp run.\n\n",
             switched, n, switched_with_gain, switched_near_tie_148))
 
-cat(" - paired_comparison_148_vs_300.csv\n")
-
-
 cat("\nDone. Outputs:\n",
     " - cytb_unknown_best_matches148.csv\n",
     " - cytb_unknown_best_matches300.csv\n",
+    " - paired_comparison_148_vs_300.csv\n",
     " - cytb_tree_full_148.{pdf,png}\n",
     " - cytb_tree_full_300.{pdf,png}\n",
     " - plots_margin_hist.{pdf,png}\n",
     " - plots_identity_vs_margin.{pdf,png}\n", sep="")
+
