@@ -1,5 +1,5 @@
 # ==================== BAT CYTB — 148-bp & ~300-bp (NJ + bootstrap) ====================
-# Clean, journal-ready outputs:
+# Outputs:
 #  - cytb_unknown_best_matches148.csv
 #  - cytb_unknown_best_matches300.csv
 #  - paired_comparison_148_vs_300.csv
