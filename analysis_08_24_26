@@ -1,0 +1,847 @@
+# ============================================================
+# BAT cytb REVISION ANALYSIS
+# Purpose:
+#   1. Read .ab1 chromatograms
+#   2. Use ABI Phred quality scores
+#   3. Locate reverse-primer sequence to define amplicon end
+#   4. Trim low-quality sequence
+#   5. Export cleaned cytb sequences
+#   6. Compare cleaned sequences to reference panel
+#   7. Flag low-similarity / ambiguous samples as unresolved
+#   8. Build NJ tree with bootstrap support
+#
+# IMPORTANT:
+# This replaces the original 300-bp "extended window" analysis.
+# Keep the original submitted script unchanged for records.
+# ============================================================
+
+
+# -------------------- PACKAGES --------------------
+
+suppressPackageStartupMessages({
+  library(sangerseqR)
+  library(Biostrings)
+  library(DECIPHER)
+  library(ape)
+  library(dplyr)
+  library(ggplot2)
+})
+
+
+# -------------------- PARAMETERS --------------------
+setwd("~/Library/CloudStorage/Box-Box/Bats")
+
+folder <- "data/cytb"
+
+known_seq_file <- "cytb_known_batseqs.fasta"
+
+# PCR / sequencing primers
+forward_primer <- DNAString("TACGCAATCCTACGATCAATTCC")
+reverse_primer <- DNAString("GGTTGTCCTCCAATTCATGTTAG")
+
+# Because sequencing was performed from the forward primer,
+# the sequence encountered near the END of the read should be
+# the reverse complement of H15748.
+reverse_primer_rc <- reverseComplement(reverse_primer)
+
+# ABI base-quality settings
+min_phred <- 20
+
+# Require a run of acceptable bases before accepting sequence.
+# These values can be adjusted after examining all chromatograms.
+quality_window <- 10
+min_good_in_window <- 8
+
+# Allow a small amount of sequencing error when detecting
+# the reverse primer.
+max_reverse_primer_mismatch <- 2
+
+# Conservative reporting criteria.
+# These are OPERATIONAL criteria, not universal species boundaries.
+min_identity_for_provisional_call <- 98
+min_margin_for_provisional_call <- 1
+
+set.seed(1)
+
+
+# ============================================================
+# 1. HELPER FUNCTIONS
+# ============================================================
+
+
+# ---------- Read sequence + Phred scores from ABI ----------
+
+read_abi_data <- function(file) {
+  
+  abif <- read.abif(file)
+  
+  # Primary basecalls
+  seq_raw <- toupper(abif@data$PBAS.2)
+  
+  # ABI confidence / Phred-like scores
+  qual <- abif@data$PCON.2
+  
+  bases <- strsplit(seq_raw, "")[[1]]
+  
+  # Occasionally lengths can differ slightly depending on file.
+  n <- min(length(bases), length(qual))
+  
+  bases <- bases[seq_len(n)]
+  qual  <- qual[seq_len(n)]
+  
+  data.frame(
+    position = seq_len(n),
+    base = bases,
+    phred = qual,
+    stringsAsFactors = FALSE
+  )
+}
+
+
+# ---------- Find usable left boundary using quality ----------
+
+find_quality_start <- function(df,
+                               min_phred = 20,
+                               window = 10,
+                               min_good = 8) {
+  
+  q <- df$phred
+  
+  if (length(q) < window)
+    return(1L)
+  
+  for (i in seq_len(length(q) - window + 1)) {
+    
+    z <- q[i:(i + window - 1)]
+    
+    if (sum(z >= min_phred, na.rm = TRUE) >= min_good)
+      return(i)
+  }
+  
+  NA_integer_
+}
+
+
+# ---------- Find reverse-primer boundary ----------
+
+find_reverse_primer <- function(seq_string,
+                                primer_rc,
+                                max_mismatch = 2) {
+  
+  subject <- DNAString(seq_string)
+  
+  hits <- matchPattern(
+    pattern = primer_rc,
+    subject = subject,
+    max.mismatch = max_mismatch,
+    with.indels = FALSE,
+    fixed = FALSE
+  )
+  
+  if (length(hits) == 0)
+    return(NULL)
+  
+  data.frame(
+    start = start(hits),
+    end = end(hits),
+    width = width(hits)
+  )
+}
+
+
+# ---------- Sequence complexity / ambiguity ----------
+
+sequence_qc <- function(seq_string) {
+  
+  chars <- strsplit(toupper(seq_string), "")[[1]]
+  
+  n_total <- length(chars)
+  
+  n_acgt <- sum(chars %in% c("A", "C", "G", "T"))
+  n_ambiguous <- n_total - n_acgt
+  
+  data.frame(
+    length = n_total,
+    n_unambiguous = n_acgt,
+    n_ambiguous = n_ambiguous,
+    pct_unambiguous =
+      ifelse(n_total > 0, 100 * n_acgt / n_total, NA_real_)
+  )
+}
+
+
+# ---------- Percent identity matrix ----------
+
+pid_matrix_from_alignment <- function(aln) {
+  
+  bases <- c("A", "C", "G", "T")
+  
+  nm <- names(aln)
+  
+  M <- do.call(
+    rbind,
+    strsplit(as.character(aln), "")
+  )
+  
+  M <- toupper(M)
+  rownames(M) <- nm
+  
+  n <- nrow(M)
+  
+  pid <- matrix(
+    NA_real_,
+    n,
+    n,
+    dimnames = list(nm, nm)
+  )
+  
+  valid <- matrix(
+    0L,
+    n,
+    n,
+    dimnames = list(nm, nm)
+  )
+  
+  if (n >= 2) {
+    
+    for (i in 1:(n - 1)) {
+      
+      for (j in (i + 1):n) {
+        
+        mask <- M[i, ] %in% bases &
+          M[j, ] %in% bases
+        
+        comp <- sum(mask)
+        
+        valid[i, j] <- valid[j, i] <- comp
+        
+        if (comp > 0) {
+          
+          pid[i, j] <- pid[j, i] <-
+            100 * sum(M[i, mask] == M[j, mask]) / comp
+        }
+      }
+    }
+  }
+  
+  diag(pid) <- 100
+  diag(valid) <- ncol(M)
+  
+  list(
+    pid = pid,
+    valid = valid
+  )
+}
+
+
+# ---------- Get best and second-best reference ----------
+
+nearest_reference_table <- function(pid,
+                                    valid,
+                                    unknown_ids,
+                                    known_ids,
+                                    min_overlap = 100) {
+  
+  do.call(
+    rbind,
+    lapply(unknown_ids, function(u) {
+      
+      ids <- intersect(known_ids, colnames(pid))
+      
+      pct <- pid[u, ids]
+      overlap <- valid[u, ids]
+      
+      ok <- !is.na(pct) & overlap >= min_overlap
+      
+      if (!any(ok)) {
+        
+        return(
+          data.frame(
+            sample = u,
+            best_reference = NA,
+            pct_identity = NA,
+            aligned_bases = NA,
+            second_reference = NA,
+            second_pct_identity = NA,
+            margin = NA
+          )
+        )
+      }
+      
+      pct_ok <- pct[ok]
+      overlap_ok <- overlap[ok]
+      
+      ord <- order(pct_ok, decreasing = TRUE)
+      
+      best <- names(pct_ok)[ord[1]]
+      
+      best_pct <- pct_ok[ord[1]]
+      best_overlap <- overlap_ok[ord[1]]
+      
+      if (length(ord) >= 2) {
+        
+        second <- names(pct_ok)[ord[2]]
+        second_pct <- pct_ok[ord[2]]
+        margin <- best_pct - second_pct
+        
+      } else {
+        
+        second <- NA
+        second_pct <- NA
+        margin <- NA
+      }
+      
+      data.frame(
+        sample = u,
+        best_reference = best,
+        pct_identity = round(best_pct, 2),
+        aligned_bases = best_overlap,
+        second_reference = second,
+        second_pct_identity =
+          ifelse(is.na(second_pct),
+                 NA,
+                 round(second_pct, 2)),
+        margin =
+          ifelse(is.na(margin),
+                 NA,
+                 round(margin, 2)),
+        stringsAsFactors = FALSE
+      )
+    })
+  )
+}
+
+
+# ============================================================
+# 2. PROCESS EVERY .ab1 FILE
+# ============================================================
+
+ab1_files <- list.files(
+  folder,
+  pattern = "\\.ab1$",
+  full.names = TRUE
+)
+
+stopifnot(length(ab1_files) > 0)
+
+
+cleaned_sequences <- list()
+qc_results <- list()
+
+
+for (file in ab1_files) {
+  
+  sample_id <- tools::file_path_sans_ext(
+    basename(file)
+  )
+  
+  dat <- read_abi_data(file)
+  
+  full_sequence <- paste0(dat$base, collapse = "")
+  
+  # -------------------------------------
+  # LEFT END: quality-based trimming
+  # -------------------------------------
+  
+  qstart <- find_quality_start(
+    dat,
+    min_phred = min_phred,
+    window = quality_window,
+    min_good = min_good_in_window
+  )
+  
+  
+  # -------------------------------------
+  # RIGHT END: locate reverse primer
+  # -------------------------------------
+  
+  primer_hits <- find_reverse_primer(
+    full_sequence,
+    reverse_primer_rc,
+    max_mismatch =
+      max_reverse_primer_mismatch
+  )
+  
+  
+  if (!is.null(primer_hits)) {
+    
+    # Prefer the first plausible reverse-primer hit
+    primer_start <- primer_hits$start[1]
+    
+    # Do NOT include the reverse primer itself.
+    qend <- primer_start - 1
+    
+    reverse_primer_found <- TRUE
+    
+  } else {
+    
+    # If the reverse primer is not found, fall back to
+    # the last high-quality position, but flag sample.
+    good_positions <- which(
+      dat$phred >= min_phred
+    )
+    
+    if (length(good_positions) > 0) {
+      qend <- max(good_positions)
+    } else {
+      qend <- NA_integer_
+    }
+    
+    reverse_primer_found <- FALSE
+  }
+  
+  
+  # -------------------------------------
+  # Extract cleaned target sequence
+  # -------------------------------------
+  
+  valid_bounds <-
+    !is.na(qstart) &&
+    !is.na(qend) &&
+    qend >= qstart
+  
+  
+  if (valid_bounds) {
+    
+    target_df <- dat[
+      qstart:qend,
+      ,
+      drop = FALSE
+    ]
+    
+    cleaned_seq <- paste0(
+      target_df$base,
+      collapse = ""
+    )
+    
+  } else {
+    
+    cleaned_seq <- NA_character_
+  }
+  
+  
+  # -------------------------------------
+  # QC summary
+  # -------------------------------------
+  
+  if (!is.na(cleaned_seq)) {
+    
+    seq_qc <- sequence_qc(cleaned_seq)
+    
+  } else {
+    
+    seq_qc <- data.frame(
+      length = NA,
+      n_unambiguous = NA,
+      n_ambiguous = NA,
+      pct_unambiguous = NA
+    )
+  }
+  
+  
+  qc_results[[sample_id]] <-
+    data.frame(
+      sample = sample_id,
+      raw_read_length = nrow(dat),
+      quality_start = qstart,
+      target_end = qend,
+      reverse_primer_found =
+        reverse_primer_found,
+      cleaned_length = seq_qc$length,
+      ambiguous_bases =
+        seq_qc$n_ambiguous,
+      pct_unambiguous =
+        round(seq_qc$pct_unambiguous, 2),
+      stringsAsFactors = FALSE
+    )
+  
+  
+  if (!is.na(cleaned_seq)) {
+    
+    cleaned_sequences[[sample_id]] <-
+      DNAString(cleaned_seq)
+  }
+}
+
+
+qc_table <- bind_rows(qc_results)
+
+write.csv(
+  qc_table,
+  "cytb_sequence_QC.csv",
+  row.names = FALSE
+)
+
+
+# ============================================================
+# 3. EXPORT CLEANED SEQUENCES FOR BLAST
+# ============================================================
+
+cleaned_set <- DNAStringSet(cleaned_sequences)
+
+writeXStringSet(
+  cleaned_set,
+  filepath =
+    "cytb_cleaned_sequences_for_BLAST.fasta"
+)
+
+
+# ============================================================
+# 4. LOAD REFERENCE PANEL
+# ============================================================
+
+references <- readDNAStringSet(
+  known_seq_file
+)
+
+# Do NOT strip sample gaps before QC.
+# Align cleaned sequences and references together.
+combined <- DECIPHER::AlignSeqs(
+  c(cleaned_set, references),
+  verbose = FALSE
+)
+
+
+# ============================================================
+# 5. COMPUTE MATCHES
+# ============================================================
+
+pm <- pid_matrix_from_alignment(combined)
+
+unknown_ids <- names(cleaned_set)
+known_ids <- names(references)
+
+# Require a substantial amount of overlapping sequence.
+# Change if your final cleaned target is consistently shorter.
+min_overlap <- 100
+
+matches <- nearest_reference_table(
+  pid = pm$pid,
+  valid = pm$valid,
+  unknown_ids = unknown_ids,
+  known_ids = known_ids,
+  min_overlap = min_overlap
+)
+
+
+# ============================================================
+# 6. ASSIGN CONSERVATIVE INTERPRETATION
+# ============================================================
+
+matches <- matches %>%
+  mutate(
+    
+    provisional_status = case_when(
+      
+      is.na(pct_identity) ~
+        "UNRESOLVED",
+      
+      aligned_bases < min_overlap ~
+        "UNRESOLVED",
+      
+      pct_identity <
+        min_identity_for_provisional_call ~
+        "LOW_SIMILARITY",
+      
+      is.na(margin) ~
+        "UNRESOLVED",
+      
+      margin <
+        min_margin_for_provisional_call ~
+        "AMBIGUOUS_BEST_MATCH",
+      
+      TRUE ~
+        "PROVISIONAL_MATCH"
+    )
+  )
+
+
+write.csv(
+  matches,
+  "cytb_cleaned_reference_matches.csv",
+  row.names = FALSE
+)
+
+
+# ============================================================
+# 7. MERGE QC + MATCH RESULTS
+# ============================================================
+
+final_table <- qc_table %>%
+  left_join(
+    matches,
+    by = "sample"
+  )
+
+
+write.csv(
+  final_table,
+  "cytb_final_sample_results.csv",
+  row.names = FALSE
+)
+
+
+# ============================================================
+# 8. FLAG SAMPLES NEEDING MANUAL REVIEW
+# ============================================================
+
+flagged <- final_table %>%
+  filter(
+    reverse_primer_found == FALSE |
+      pct_unambiguous < 95 |
+      provisional_status !=
+      "PROVISIONAL_MATCH"
+  )
+
+
+write.csv(
+  flagged,
+  "cytb_samples_for_manual_review.csv",
+  row.names = FALSE
+)
+
+
+# ============================================================
+# 9. NEIGHBOR-JOINING TREE
+# ============================================================
+
+tree_pid <-
+  pid_matrix_from_alignment(combined)
+
+D <- 1 - tree_pid$pid / 100
+
+# Missing pairwise values should NOT silently create
+# biological similarity.
+# Remove samples that cannot be compared adequately
+# before tree construction.
+
+bad_rows <- apply(
+  D,
+  1,
+  function(x)
+    any(is.na(x))
+)
+
+tree_alignment <-
+  combined[!bad_rows]
+
+tree_pid2 <-
+  pid_matrix_from_alignment(
+    tree_alignment
+  )
+
+D2 <- 1 - tree_pid2$pid / 100
+
+diag(D2) <- 0
+
+tree <- ape::nj(
+  as.dist(D2)
+)
+
+
+# ============================================================
+# 10. BOOTSTRAP TREE
+# ============================================================
+
+bootstrap_nj <- function(aln,
+                         tree,
+                         B = 1000) {
+  
+  M <- toupper(
+    do.call(
+      rbind,
+      strsplit(
+        as.character(aln),
+        ""
+      )
+    )
+  )
+  
+  rownames(M) <- names(aln)
+  
+  bases <- c(
+    "A", "C", "G", "T"
+  )
+  
+  build_tree <- function(cols) {
+    
+    X <- M[, cols, drop = FALSE]
+    
+    n <- nrow(X)
+    
+    pid <- matrix(
+      NA_real_,
+      n,
+      n,
+      dimnames =
+        list(
+          rownames(X),
+          rownames(X)
+        )
+    )
+    
+    for (i in 1:(n - 1)) {
+      
+      for (j in (i + 1):n) {
+        
+        mask <-
+          X[i, ] %in% bases &
+          X[j, ] %in% bases
+        
+        if (sum(mask) > 0) {
+          
+          pid[i, j] <-
+            pid[j, i] <-
+            mean(
+              X[i, mask] ==
+                X[j, mask]
+            )
+        }
+      }
+    }
+    
+    diag(pid) <- 1
+    
+    d <- 1 - pid
+    
+    ape::nj(
+      as.dist(d)
+    )
+  }
+  
+  
+  ape::boot.phylo(
+    tree,
+    M,
+    FUN = function(x)
+      build_tree(
+        sample(
+          seq_len(ncol(M)),
+          replace = TRUE
+        )
+      ),
+    B = B
+  )
+}
+
+
+bootstrap_values <-
+  bootstrap_nj(
+    tree_alignment,
+    tree,
+    B = 1000
+  )
+
+
+# ============================================================
+# 11. EXPORT HIGH-RESOLUTION TREE
+# ============================================================
+
+pdf(
+  "cytb_cleaned_NJ_tree.pdf",
+  width = 11,
+  height = 16
+)
+
+par(
+  mar = c(4, 4, 2, 4)
+)
+
+plot(
+  tree,
+  type = "phylogram",
+  cex = 0.7,
+  label.offset = 0.003
+)
+
+# Show only support >=70
+bs_labels <-
+  ifelse(
+    bootstrap_values >= 70,
+    round(bootstrap_values),
+    ""
+  )
+
+nodelabels(
+  text = bs_labels,
+  frame = "none",
+  cex = 0.7
+)
+
+dev.off()
+
+
+# ============================================================
+# 12. SIMPLE SUMMARY
+# ============================================================
+
+cat(
+  "\n===== ANALYSIS SUMMARY =====\n"
+)
+
+cat(
+  "Total AB1 files:",
+  length(ab1_files),
+  "\n"
+)
+
+cat(
+  "Reverse primer detected:",
+  sum(
+    qc_table$reverse_primer_found,
+    na.rm = TRUE
+  ),
+  "of",
+  nrow(qc_table),
+  "\n"
+)
+
+cat(
+  "Provisional matches:",
+  sum(
+    matches$provisional_status ==
+      "PROVISIONAL_MATCH",
+    na.rm = TRUE
+  ),
+  "\n"
+)
+
+cat(
+  "Ambiguous best matches:",
+  sum(
+    matches$provisional_status ==
+      "AMBIGUOUS_BEST_MATCH",
+    na.rm = TRUE
+  ),
+  "\n"
+)
+
+cat(
+  "Low-similarity samples:",
+  sum(
+    matches$provisional_status ==
+      "LOW_SIMILARITY",
+    na.rm = TRUE
+  ),
+  "\n"
+)
+
+cat(
+  "Unresolved:",
+  sum(
+    matches$provisional_status ==
+      "UNRESOLVED",
+    na.rm = TRUE
+  ),
+  "\n"
+)
+
+cat(
+  "\nFiles written:\n",
+  "cytb_sequence_QC.csv\n",
+  "cytb_cleaned_sequences_for_BLAST.fasta\n",
+  "cytb_cleaned_reference_matches.csv\n",
+  "cytb_final_sample_results.csv\n",
+  "cytb_samples_for_manual_review.csv\n",
+  "cytb_cleaned_NJ_tree.pdf\n"
+)
